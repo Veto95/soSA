@@ -15,6 +15,10 @@ from concurrent.futures import ThreadPoolExecutor
 from termcolor import colored
 from collections import defaultdict
 
+if sys.version_info < (3, 7):
+    print(colored("[!] Error: Python 3.7+ required for regex compatibility.", "red"))
+    sys.exit(1)
+
 RCE_KEYWORDS = [
     'system', 'exec', 'sh', '/bin', 'chmod', 'su', 'curl', 'wget', 'eval',
     'Runtime', 'loadLibrary', 'popen', 'dlopen', 'dlsym', 'fopen',
@@ -51,10 +55,11 @@ def check_dependencies():
 
 def run_cmd(cmd):
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        return f"[!] Error running: {' '.join(cmd)}\n{e}"
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            return f"[!] Error running: {' '.join(cmd)}\n{stderr}"
+        return stdout.strip()
     except FileNotFoundError:
         return f"[!] Error: Command {' '.join(cmd)} not found."
 
@@ -78,7 +83,7 @@ def scan_strings(strings_out):
             if re.search(pattern, line):
                 results['sensitive'].append((label, line))
         # URLs
-        if re.search(r'https?://[^\s"']+', line):
+        if re.search(r'https?://[^ \t\n"\'<>]+', line):
             results['urls'].append(line)
         # JNI methods
         if re.search(r'Java_[a-zA-Z0-9_]+', line):
@@ -96,72 +101,104 @@ def scan_strings(strings_out):
 def log_print(msg, color=None, file=None, redact=False):
     clean_msg = re.sub(r'\x1b\[[0-9;]*m', '', msg)
     if redact and file:
-        clean_msg = re.sub(r'(?i)(api[_-]?key|access[_-]?token|pass(word)?|secret|token)[\"'=:\\s]{1,5}[^\"'\s]+', '[REDACTED]', clean_msg)
+        for pattern in SENSITIVE_PATTERNS.values():
+            clean_msg = re.sub(pattern, '[REDACTED]', clean_msg)
     clean_msg = ''.join(c for c in clean_msg if c.isprintable())
     if file:
         file.write(clean_msg + '\n')
     print(colored(msg, color) if color else msg)
 
 def analyze_so_file(path, verbose=True, write_json=False, redact=False):
+    if not os.path.exists(path):
+        log_print(f"[!] Error: File {path} does not exist.", "red")
+        return
+    if not path.lower().endswith('.so'):
+        log_print(f"[!] Error: {path} is not a .so file.", "red")
+        return
+
     risk_score = 0
     output = {}
     report_file = f"report_{os.path.basename(path)}.txt"
     try:
         with open(report_file, 'w', encoding='utf-8') as log:
-            log_print(f"\n📂 Analyzing: {path}", "cyan", log, redact)
-            log_print("🔎 ELF Header:", "magenta", log, redact)
-            elf_header = run_cmd(['readelf', '-h', path])
-            log_print(elf_header, file=log)
+            def log_verbose(msg, color=None, file=None):
+                if verbose:
+                    log_print(msg, color, file, redact)
 
-            log_print("\n🔧 Exported Symbols:", "magenta", log, redact)
+            log_verbose(f"\n📂 Analyzing: {path}", "cyan", log)
+            log_verbose("🔎 ELF Header:", "magenta", log)
+            elf_header = run_cmd(['readelf', '-h', path])
+            if "Error" in elf_header:
+                log_verbose(f"[!] Failed to parse ELF header: {elf_header}", "red", log)
+                return
+            log_verbose(elf_header, file=log)
+
+            log_verbose("\n🔧 Exported Symbols:", "magenta", log)
             nm_output = run_cmd(['nm', '-D', path])
-            log_print(nm_output, file=log)
+            if "Error" in nm_output:
+                log_verbose(f"[!] Failed to parse symbols: {nm_output}", "red", log)
+                return
+            if not nm_output.strip():
+                log_verbose("[!] No symbols found in file.", "yellow", log)
+                return
+            log_verbose(nm_output, file=log)
 
             rce_matches = [line for line in nm_output.splitlines() if any(k in line for k in RCE_KEYWORDS)]
-            log_print("\n💣 RCE-Related Symbols:", "red", log, redact)
+            log_verbose("\n💣 RCE-Related Symbols:", "red", log)
             if rce_matches:
                 for rce in rce_matches:
-                    log_print(f"[*] {rce}", "red", log, redact)
+                    log_verbose(f"[*] {rce}", "red", log)
                     risk_score += 5
                     SUMMARY['RCE'].append((path, rce))
             else:
-                log_print("[-] None found.", file=log)
+                log_verbose("[-] None found.", file=log)
 
-            strings_out = run_cmd(['strings', path]).splitlines()
+            log_verbose("\n🕵 Sensitive Patterns:", "yellow", log)
+            strings_cmd = ['strings', path]
+            try:
+                process = subprocess.Popen(strings_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                strings_out = [line.strip() for line in process.stdout if line.strip()]
+                stderr = process.stderr.read()
+                if process.returncode != 0:
+                    log_verbose(f"[!] Failed to extract strings: {stderr}", "red", log)
+                    return
+            except FileNotFoundError:
+                log_verbose(f"[!] Error: strings command not found.", "red", log)
+                return
+
             scanned = scan_strings(strings_out)
-
-            log_print("\n🕵 Sensitive Patterns:", "yellow", log, redact)
             for label, line in scanned['sensitive']:
-                log_print(f"[!] {label}: {line}", "yellow", log, redact)
+                log_verbose(f"[!] {label}: {line}", "yellow", log)
                 risk_score += 3
                 SUMMARY[label].append((path, line))
 
-            log_print("\n🌍 URLs:", "blue", log, redact)
+            log_verbose("\n🌍 URLs:", "blue", log)
             for url in scanned['urls']:
-                log_print(f"[+] URL: {url}", "blue", log, redact)
+                log_verbose(f"[+] URL: {url}", "blue", log)
                 risk_score += 1
                 if re.search(r'(malicious|phishing|exploit)\.com', url, re.I):
                     risk_score += 5
-                    log_print(f"[!] Suspicious URL detected: {url}", "red", log, redact)
+                    log_verbose(f"[!] Suspicious URL detected: {url}", "red", log)
                 SUMMARY['URLs'].append((path, url))
 
-            log_print("\n🔐 Base64 Encoded Strings:", "green", log, redact)
+            log_verbose("\n🔐 Base64 Encoded Strings:", "green", log)
             for b64, decoded in scanned['base64']:
-                log_print(f"[+] Encoded: {b64}\n    → {decoded}", "green", log, redact)
+                log_verbose(f"[+] Encoded: {b64}\n    → {decoded}", "green", log)
                 SUMMARY['Base64'].append((path, decoded))
 
-            log_print("\n🧬 JNI Methods:", "cyan", log, redact)
+            log_verbose("\n🧬 JNI Methods:", "cyan", log)
             for jni in scanned['jni']:
-                log_print(f"[*] {jni}", "cyan", log, redact)
+                log_verbose(f"[*] {jni}", "cyan", log)
                 SUMMARY['JNI'].append((path, jni))
 
-            log_print(f"\n🧲 Final Risk Score: {risk_score}", "magenta", log, redact)
+            risk_score = min(risk_score, 100)  # Cap risk score
+            log_verbose(f"\n🧲 Final Risk Score: {risk_score}", "magenta", log)
             if risk_score >= 10:
-                log_print("⚠️  Risk: HIGH", "red", log, redact)
+                log_verbose("⚠️  Risk: HIGH", "red", log)
             elif risk_score >= 5:
-                log_print("⚠️  Risk: MEDIUM", "yellow", log, redact)
+                log_verbose("⚠️  Risk: MEDIUM", "yellow", log)
             else:
-                log_print("✅ Risk: LOW", "green", log, redact)
+                log_verbose("✅ Risk: LOW", "green", log)
 
             output.update({
                 "file": path,
@@ -192,15 +229,21 @@ def analyze_so_file(path, verbose=True, write_json=False, redact=False):
             log_print(f"[!] Unexpected error writing JSON: {e}", "red")
 
 def threaded_scan(folder, write_json=False, redact=False):
+    if not os.path.isdir(folder):
+        log_print(f"[!] Error: {folder} is not a directory.", "red")
+        return
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = []
         for root, _, files in os.walk(folder):
             for file in files:
-                if file.endswith('.so'):
+                if file.lower().endswith('.so'):
                     path = os.path.join(root, file)
                     futures.append(executor.submit(analyze_so_file, path, True, write_json, redact))
         for future in futures:
-            future.result()
+            try:
+                future.result()
+            except Exception as e:
+                log_print(f"[!] Thread error for {path}: {e}", "red")
 
 def show_summary():
     print(colored("\n================= 🔚 SUMMARY =================", "cyan"))
@@ -216,12 +259,13 @@ def main():
     parser.add_argument("path", help="Path to .so file or folder")
     parser.add_argument("--json", action="store_true", help="Save detailed JSON report per file")
     parser.add_argument("--redact", action="store_true", help="Redact sensitive data in logs")
+    parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     args = parser.parse_args()
 
     if os.path.isdir(args.path):
         threaded_scan(args.path, args.json, args.redact)
     else:
-        analyze_so_file(args.path, write_json=args.json, redact=args.redact)
+        analyze_so_file(args.path, args.verbose, args.json, args.redact)
 
     show_summary()
 
