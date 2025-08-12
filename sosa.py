@@ -124,7 +124,7 @@ def analyze_so_file(so_path):
         else:
             log_print("[+] Risk Level: LOW ✅", "green")
 
-        log_print("\n[✓] Analysis complete. Powered by 0xCACT2S t.me/H3LL_SHELL")
+        log_print("\n[✓] Analysis complete. Powered by 0xCACT2S https://t.me/H3LL_SHELL")
 
 def main():
     parser = argparse.ArgumentParser(description="Android Native Scanner - Analyze .so files for RCE, sensitive data, keys, URLs, JNI.")
