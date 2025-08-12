@@ -12,7 +12,7 @@ import re
 import base64
 from termcolor import colored
 
-RCE_KEYWORDS = ['system', 'exec', 'sh', '/bin', 'chmod', 'su', 'curl', 'wget', 'eval', 'Runtime', 'loadLibrary', 'popen', 'dlopen', 'dlsym', 'fopen', 'strcpy', 'sprintf']
+RCE_KEYWORDS = ['system', 'exec', 'sh', '/bin', 'chmod', 'su', 'curl', 'wget', 'eval', 'Runtime', 'loadLibrary', 'popen', 'dlopen', 'dlsym', 'fopen', 'strcpy', 'sprintf', 'bash']
 
 SENSITIVE_PATTERNS = {
     "Google API Key": r"AIza[0-9A-Za-z-_]{35}",
